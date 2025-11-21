@@ -10,7 +10,7 @@
 
 require_once(__DIR__ . '/../../config.php');
 require_once($CFG->libdir . '/adminlib.php');
-require_once($CFG->dirroot . '/group/lib.php');
+require_once($CFG->dirroot . '/group/lib.php'); // groups API (groups_add_member etc)
 require_once(__DIR__ . '/classes/form/upload_form.php');
 
 use local_groupassign\form\upload_form;
@@ -19,7 +19,7 @@ admin_externalpage_setup('local_groupassign');
 $context = context_system::instance();
 require_capability('local/groupassign:manage', $context);
 
-$PAGE->set_url(new moodle_url('/local/local_groupassign/index.php'));
+$PAGE->set_url(new moodle_url('/local/groupassign/index.php'));
 $PAGE->set_title(get_string('pluginname', 'local_groupassign'));
 $PAGE->set_heading(get_string('pluginname', 'local_groupassign'));
 
@@ -51,7 +51,7 @@ if ($data = $form->get_data()) {
     if ($draftitemid) {
         $fs = get_file_storage();
         $usercontext = context_user::instance($USER->id);
-        // get_area_files returns file objects; exclude directories so false = no files
+        // get_area_files returns file objects; exclude directories
         $files = $fs->get_area_files($usercontext->id, 'user', 'draft', $draftitemid, 'id', false);
 
         if (!empty($files)) {
@@ -89,9 +89,12 @@ if ($data = $form->get_data()) {
     }
 
     // -----------------------------
-    // 5) Process CSV
+    // 5) Process CSV (identifyby + creategroups come from the form if used)
     // -----------------------------
-    $results = local_groupassign_process_csv($tmpname, $courseid);
+    $identifyby = isset($data->identifyby) ? $data->identifyby : 'username';
+    $creategroups = isset($data->creategroups) ? (int)$data->creategroups : 1;
+
+    $results = local_groupassign_process_csv($tmpname, $courseid, $identifyby, $creategroups);
 
     // remove temp copy if we created it
     if (strpos($tmpname, '/temp/') !== false || strpos($tmpname, 'csv_') !== false) {
@@ -122,26 +125,51 @@ if ($data = $form->get_data()) {
     // Result list
     echo $resultul;
 
-    // Refresh notice with countdown
+    // NEW: redirect to plugin page (fresh form) instead of reload
     $refreshseconds = 5;
-    $note = "This page will refresh automatically in <span id=\"ga-countdown\">{$refreshseconds}</span> seconds.";
-    echo html_writer::tag('p', $note);
+    $redirecturl = (new moodle_url('/local/groupassign/index.php'))->out(false);
 
-    // Add JS to countdown and refresh
+    // show note + button
+    $note = "
+        <div style='margin-top:15px;font-size:14px;'>
+            This page will redirect to the form in 
+            <strong><span id=\"ga-countdown\">{$refreshseconds}</span></strong> seconds.
+            <br><br>
+            <button id=\"ga-redirect-btn\" class=\"btn btn-primary\">
+                Go to form now
+            </button>
+        </div>
+    ";
+    echo html_writer::tag('div', $note);
+
+    // safe JSON encode the redirect URL for JS
+    $redirectjson = json_encode($redirecturl);
+
     $js = "
     <script type=\"text/javascript\">
     (function(){
         var secs = {$refreshseconds};
         var el = document.getElementById('ga-countdown');
+        var btn = document.getElementById('ga-redirect-btn');
+        var redirect = {$redirectjson};
+
+        // Manual button click -> immediate redirect to form (no POST re-submit)
+        if (btn) {
+            btn.addEventListener('click', function() {
+                location.replace(redirect);
+            });
+        }
+
+        // Automatic countdown -> redirect to form when finished
         var t = setInterval(function(){
             secs--;
-            if (!el) return;
-            el.textContent = secs;
+            if (el) el.textContent = secs;
             if (secs <= 0) {
                 clearInterval(t);
-                location.reload();
+                // use replace() so user can't go back to the result-page which would re-run the POST
+                location.replace(redirect);
             }
-        }, 1000);
+        }, 5000);
     })();
     </script>
     ";
@@ -150,7 +178,6 @@ if ($data = $form->get_data()) {
     echo $OUTPUT->box_end();
     echo $OUTPUT->footer();
     exit;
-
 }
 
 // display form
@@ -160,10 +187,9 @@ echo $OUTPUT->footer();
 
 
 // -----------------------------
-// CSV processor (same as before)
+// CSV processor (robust BOM/delimiter + identifyby + creategroups)
 // -----------------------------
-// REPLACE the old local_groupassign_process_csv function with this one
-function local_groupassign_process_csv($filepath, $courseid) {
+function local_groupassign_process_csv($filepath, $courseid, $identifyby = 'username', $creategroups = 1) {
     global $DB;
 
     $resultlines = [];
@@ -174,9 +200,7 @@ function local_groupassign_process_csv($filepath, $courseid) {
     }
 
     $handle = fopen($filepath, 'r');
-    if (!$handle) {
-        return [ get_string('invalidfile','local_groupassign') ];
-    }
+    if (!$handle) return [ get_string('invalidfile','local_groupassign') ];
 
     // Read first line raw (header) and remove any BOM
     $firstline = fgets($handle);
@@ -189,7 +213,6 @@ function local_groupassign_process_csv($filepath, $courseid) {
     if (substr($firstline, 0, 3) === "\xEF\xBB\xBF") {
         $firstline = substr($firstline, 3);
     }
-
     $firstline = rtrim($firstline, "\r\n");
 
     // Detect delimiter by counting occurrences (comma, semicolon, tab)
@@ -210,54 +233,66 @@ function local_groupassign_process_csv($filepath, $courseid) {
     $header = array_map('trim', $header);
     $header = array_map('strtolower', $header);
 
-    $usernamepos = array_search('username', $header);
-    $grouppos   = array_search('group', $header);
+    // Find identity column depending on chosen method
+    $idcol = ($identifyby === 'email') ? 'email' : 'username';
+    $idpos = array_search($idcol, $header);
+    $grouppos = array_search('group', $header);
 
-    if ($usernamepos === false || $grouppos === false) {
+    if ($idpos === false || $grouppos === false) {
         fclose($handle);
-        return [ 'CSV must contain headers: username,group (detected delimiter: ' . ($delimiter === "\t" ? '\\t' : $delimiter) . ')' ];
+        return [ 'CSV must contain headers: ' . $idcol . ',group (detected delimiter: ' . ($delimiter === "\t" ? '\\t' : $delimiter) . ')' ];
     }
 
     // Now read remaining rows using detected delimiter
     while (($row = fgetcsv($handle, 0, $delimiter)) !== false) {
-        // Some rows may have fewer columns; guard indexes
-        $username = isset($row[$usernamepos]) ? trim($row[$usernamepos]) : '';
+        $identifier = isset($row[$idpos]) ? trim($row[$idpos]) : '';
         $groupname = isset($row[$grouppos]) ? trim($row[$grouppos]) : '';
 
-        if ($username === '' || $groupname === '') {
+        if ($identifier === '' || $groupname === '') {
             $resultlines[] = "Skipped empty row";
             continue;
         }
 
-        // user lookup
-        if (!$user = $DB->get_record('user', ['username' => $username, 'deleted' => 0])) {
-            $resultlines[] = "$username: user not found";
+        // user lookup by chosen identity
+        if ($identifyby === 'email') {
+            $user = $DB->get_record('user', ['email' => $identifier, 'deleted' => 0]);
+        } else {
+            $user = $DB->get_record('user', ['username' => $identifier, 'deleted' => 0]);
+        }
+
+        if (!$user) {
+            $resultlines[] = "{$identifier}: SKIPPED — user not found";
             continue;
         }
 
         // enrollment check
         if (!is_enrolled($context, $user)) {
-            $resultlines[] = "$username: not enrolled";
+            $resultlines[] = "{$identifier}: SKIPPED — user exists but is NOT enrolled in this course. Add this user to the course before importing group membership.";
             continue;
         }
 
         // group check/create
         $group = $DB->get_record('groups', ['courseid' => $courseid, 'name' => $groupname]);
         if (!$group) {
-            $g = new stdClass();
-            $g->courseid = $courseid;
-            $g->name = $groupname;
-            $g->id = groups_create_group($g);
-            $group = $DB->get_record('groups', ['id' => $g->id]);
-            $resultlines[] = "Created group: $groupname";
+            if ($creategroups) {
+                $g = new stdClass();
+                $g->courseid = $courseid;
+                $g->name = $groupname;
+                $g->id = groups_create_group($g);
+                $group = $DB->get_record('groups', ['id' => $g->id]);
+                $resultlines[] = "Created group: $groupname";
+            } else {
+                $resultlines[] = "{$identifier}: SKIPPED — group '$groupname' does not exist and group creation is disabled.";
+                continue;
+            }
         }
 
         // membership
         if (!$DB->record_exists('groups_members', ['groupid' => $group->id, 'userid' => $user->id])) {
             groups_add_member($group->id, $user->id);
-            $resultlines[] = "$username added to $groupname";
+            $resultlines[] = "{$identifier}: OK — added to $groupname";
         } else {
-            $resultlines[] = "$username already in $groupname";
+            $resultlines[] = "{$identifier}: already in $groupname";
         }
     }
 
